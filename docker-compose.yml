@@ -1,0 +1,191 @@
+version: '3'
+
+networks:
+  observability-network:
+
+services:
+  app:
+    build: ./src/app-test
+    volumes:
+      - ./src/app-test:/app
+    links:
+      - fluentbit
+      - otel-collector
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: node-app
+    command: "npm start"
+    ports:
+      - "8080:8080"
+    environment:
+      - OTEL_SERVICE_NAME=apptest
+      - OTEL_RESOURCE_ATTRIBUTES="service_name.name=app-test,service.namespace=rentcars"
+    depends_on:
+      - fluentbit
+    networks:
+      - observability-network
+
+  app2:
+    build: ./src/app-test-2
+    volumes:
+      - ./src/app-test-2:/app
+    links:
+      - fluentbit
+      - otel-collector
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: node-app
+    command: "npm start"
+    ports:
+      - "8081:8080"
+    environment:
+      - OTEL_SERVICE_NAME=apptest2
+    depends_on:
+      - fluentbit
+    networks:
+      - observability-network
+
+  # Loggin processor
+  fluentbit:
+    build: ./src/fluent-bit
+    container_name: fluentbit
+    volumes:
+      - ./src/fluent-bit/conf/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+    links:
+      - otel-collector
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    networks:
+      - observability-network
+
+  # Jaeger
+  jaeger-all-in-one:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    restart: always
+    ports:
+      - "16686:16686"
+      - "14268"
+      - "14250"
+    networks:
+      - observability-network
+
+  # Zipkin
+  zipkin-all-in-one:
+    image: openzipkin/zipkin:latest
+    container_name: zipkin
+    restart: always
+    ports:
+      - "9411:9411"
+    networks:
+      - observability-network
+
+  # Collector
+  otel-collector:
+    build: ./src/otel
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml", "${OTELCOL_ARGS}"]
+    volumes:
+      - ./src/otel/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "1888:1888"   # pprof extension
+      - "8888:8888"   # Prometheus metrics exposed by the collector
+      - "8889:8889"   # Prometheus exporter metrics
+      - "13133:13133" # health_check extension
+      - "5555:5555"   # OTLP gRPC receiver
+    # - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "55679:55679" # zpages extension
+    depends_on:
+      - jaeger-all-in-one
+      - zipkin-all-in-one
+    networks:
+      - observability-network
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./src/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ./src/grafana/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    ports:
+      - "3000:3000"
+    networks:
+      - observability-network
+  
+  tempo:
+    image: ./src/tempo
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./src/tempo/tempo.yaml:/etc/tempo.yaml
+      - ./data/tempo-data:/tmp/tempo
+    ports:
+    #  - "14268:14268"  # jaeger ingest
+      - "3200:3200"     # tempo
+      - "4317"          # otlp grpc
+    #  - "4318:4318"    # otlp http
+    #  - "9411:9411"    # zipkin
+    depends_on:
+      - minio
+    networks:
+      - observability-network
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      - MINIO_ACCESS_KEY=tempo
+      - MINIO_SECRET_KEY=supersecret
+    ports:
+      - "9001:9001"
+    entrypoint:
+      - sh
+      - -euc
+      - mkdir -p /data/tempo && /opt/bin/minio server /data --console-address ':9001'
+    networks:
+      - observability-network
+
+  prometheus:
+    build: ./src/prometheus
+    command:
+      - --web.console.templates=/etc/prometheus/consoles
+      - --web.console.libraries=/etc/prometheus/console_libraries
+      - --storage.tsdb.retention.time=1h
+      - --config.file=/etc/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+      - --web.route-prefix=/
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./src/prometheus/prometheus.yaml:/etc/prometheus.yaml
+    ports:
+      - "9090:9090"
+    networks:
+      - observability-network
+
+  loki:
+    build: ./src/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - observability-network
+
+  # k6-tracing:
+  #   image: ghcr.io/grafana/xk6-client-tracing:v0.0.2
+  #   environment:
+  #     - ENDPOINT=tempo:4317
+  #   restart: always
+  #   depends_on:
+  #     - tempo
+  #   networks:
+  #     - observability-network
